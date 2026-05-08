@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 import traceback
 import tkinter as tk
 from pathlib import Path
@@ -34,7 +35,7 @@ def _list_images_in_folder(folder: Path) -> list[Path]:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("图片清晰化 / Mockup")
+        self.title("Picture Beauty · 图片清晰化 / Mockup")
         self.minsize(560, 400)
         self.resizable(True, False)
 
@@ -49,16 +50,19 @@ class App(tk.Tk):
         self._card_style_var = tk.StringVar(value="shots")
         self._min_short_var = tk.StringVar(value="1080")
 
+        self._cancel_event = threading.Event()
+        self._worker: threading.Thread | None = None
+
         pad = {"padx": 10, "pady": 6}
         row = 0
 
         f_main = ttk.Frame(self, padding=12)
         f_main.pack(fill=tk.BOTH, expand=True)
+        self._f_main = f_main
 
         ttk.Label(f_main, text="输入（文件或文件夹）").grid(row=row, column=0, sticky=tk.W, **pad)
-        ttk.Entry(f_main, textvariable=self._input_var, width=44).grid(
-            row=row, column=1, sticky=tk.EW, **pad
-        )
+        ent_in = ttk.Entry(f_main, textvariable=self._input_var, width=44)
+        ent_in.grid(row=row, column=1, sticky=tk.EW, **pad)
         f_in_btn = ttk.Frame(f_main)
         f_in_btn.grid(row=row, column=2, **pad)
         ttk.Button(f_in_btn, text="选文件", width=8, command=self._browse_input_file).pack(
@@ -70,17 +74,25 @@ class App(tk.Tk):
         row += 1
 
         ttk.Label(f_main, text="输出").grid(row=row, column=0, sticky=tk.W, **pad)
-        ttk.Entry(f_main, textvariable=self._output_var, width=44).grid(
-            row=row, column=1, sticky=tk.EW, **pad
-        )
-        ttk.Button(f_main, text="浏览输出…", command=self._browse_output).grid(row=row, column=2, **pad)
+        ent_out = ttk.Entry(f_main, textvariable=self._output_var, width=44)
+        ent_out.grid(row=row, column=1, sticky=tk.EW, **pad)
+        btn_out = ttk.Button(f_main, text="浏览输出…", command=self._browse_output)
+        btn_out.grid(row=row, column=2, **pad)
         row += 1
+        hint_lines = (
+            "【选的是单张图片时】此处填「保存后的完整路径」（含文件名）；也可点「浏览输出…」选择保存位置。"
+            "若留空：默认保存在原图同文件夹，文件名为「原文件名_enhanced」加原后缀。"
+            "\n"
+            "【选的是文件夹（批量）时】此处填「一个文件夹路径」，所有结果都保存到这个文件夹里；"
+            "若留空：每张图各自保存在「该图片所在文件夹」，文件名同样是「原名_enhanced」。 "
+            "（不含子文件夹，仅处理当前文件夹内的图片。）"
+        )
         ttk.Label(
             f_main,
-            text="单张：可填完整保存路径；批量：填目标文件夹，留空则每张输出在原图同目录",
+            text=hint_lines,
             foreground="gray",
             font=("TkDefaultFont", 8),
-            wraplength=440,
+            wraplength=460,
             justify=tk.LEFT,
         ).grid(row=row, column=1, columnspan=2, sticky=tk.W, padx=(10, 10), pady=(0, 8))
         row += 1
@@ -139,7 +151,8 @@ class App(tk.Tk):
         ttk.Label(f_main, text="短边最小像素").grid(row=row, column=0, sticky=tk.W, **pad)
         f_short = ttk.Frame(f_main)
         f_short.grid(row=row, column=1, columnspan=2, sticky=tk.W, **pad)
-        ttk.Entry(f_short, textvariable=self._min_short_var, width=10).pack(side=tk.LEFT)
+        ent_short = ttk.Entry(f_short, textvariable=self._min_short_var, width=10)
+        ent_short.pack(side=tk.LEFT)
         ttk.Label(f_short, text="（默认 1080，画质优先可调高）", foreground="gray").pack(
             side=tk.LEFT, padx=(8, 0)
         )
@@ -153,11 +166,39 @@ class App(tk.Tk):
         )
         row += 1
 
-        ttk.Button(f_main, text="开始处理", command=self._on_run).grid(
-            row=row, column=1, sticky=tk.E, pady=(8, 0)
-        )
+        f_actions = ttk.Frame(f_main)
+        f_actions.grid(row=row, column=1, columnspan=2, sticky=tk.E, pady=(8, 0))
+        self._btn_run = ttk.Button(f_actions, text="开始处理", command=self._on_run)
+        self._btn_run.pack(side=tk.LEFT, padx=(0, 8))
+        self._btn_stop = ttk.Button(f_actions, text="停止", command=self._on_stop, state=tk.DISABLED)
+        self._btn_stop.pack(side=tk.LEFT)
+        self._f_actions = f_actions
 
         self._sync_card_style_state()
+
+    def _set_busy(self, busy: bool) -> None:
+        st = tk.DISABLED if busy else tk.NORMAL
+
+        def walk(w: tk.Misc) -> None:
+            if w == self._f_actions:
+                return
+            cls = w.winfo_class()
+            if cls in ("TEntry", "TButton", "TRadiobutton"):
+                try:
+                    w.configure(state=st)
+                except tk.TclError:
+                    pass
+            for c in w.winfo_children():
+                walk(c)
+
+        walk(self._f_main)
+        self._btn_run.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        self._btn_stop.configure(state=tk.NORMAL if busy else tk.DISABLED)
+        if not busy:
+            self._sync_card_style_state()
+
+    def _worker_alive(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
 
     def _sync_card_style_state(self) -> None:
         on = self._canvas_var.get() != "none"
@@ -247,7 +288,43 @@ class App(tk.Tk):
 
         return [], f"路径不存在或不是文件/文件夹：\n{inp}"
 
+    def _on_stop(self) -> None:
+        self._cancel_event.set()
+        self._status.set("正在停止…（当前这张处理完后不再继续）")
+
+    def _finish_cancelled(self, completed: int, total: int) -> None:
+        self._worker = None
+        self._set_busy(False)
+        self._status.set(f"已停止（已完成 {completed}/{total} 张）")
+        messagebox.showinfo(
+            "已停止",
+            f"已完成 {completed} 张后停止。\n"
+            "说明：若停止时正在处理某一张，该张会先处理完再结束；尚未开始的不会再跑。",
+        )
+
+    def _finish_ok(self, jobs: list[tuple[Path, Path]]) -> None:
+        self._worker = None
+        self._set_busy(False)
+        total = len(jobs)
+        if total == 1:
+            self._status.set(f"完成 → {jobs[0][1]}")
+            messagebox.showinfo("完成", f"已保存：\n{jobs[0][1]}")
+            return
+        roots = {str(d.parent) for _, d in jobs}
+        where = "\n".join(sorted(roots))
+        self._status.set(f"完成 {total} 张")
+        messagebox.showinfo("完成", f"已处理 {total} 张图片。\n输出目录：\n{where}")
+
+    def _finish_error(self, tb: str) -> None:
+        self._worker = None
+        self._set_busy(False)
+        self._status.set("失败")
+        messagebox.showerror("处理失败", tb)
+
     def _on_run(self) -> None:
+        if self._worker_alive():
+            return
+
         inp = Path(self._input_var.get().strip())
         try:
             min_short = self._parse_min_short()
@@ -268,38 +345,44 @@ class App(tk.Tk):
         xhs = canvas == "xhs"
         douyin = canvas == "douyin"
         card_style = self._card_style_var.get() if canvas != "none" else "shots"
+        preset = self._preset_var.get()
 
         total = len(jobs)
+        self._cancel_event.clear()
+
+        def task() -> None:
+            completed = 0
+            try:
+                for i, (src, dst) in enumerate(jobs, start=1):
+                    if self._cancel_event.is_set():
+                        self.after(0, lambda c=completed, t=total: self._finish_cancelled(c, t))
+                        return
+                    self.after(
+                        0,
+                        lambda ii=i, name=src.name, tt=total: self._status.set(
+                            f"处理中 {ii}/{tt}：{name}"
+                        ),
+                    )
+                    run(
+                        src,
+                        dst,
+                        preset=preset,
+                        min_short=min_short,
+                        mockup_169=mockup,
+                        xhs_card=xhs,
+                        douyin_card=douyin,
+                        card_style=card_style,
+                    )
+                    completed += 1
+                self.after(0, lambda j=list(jobs): self._finish_ok(j))
+            except Exception:
+                tb = traceback.format_exc()
+                self.after(0, lambda msg=tb: self._finish_error(msg))
+
+        self._set_busy(True)
         self._status.set(f"处理中 0/{total} …")
-        self.update_idletasks()
-
-        try:
-            for i, (src, dst) in enumerate(jobs, start=1):
-                self._status.set(f"处理中 {i}/{total}：{src.name}")
-                self.update_idletasks()
-                run(
-                    src,
-                    dst,
-                    preset=self._preset_var.get(),
-                    min_short=min_short,
-                    mockup_169=mockup,
-                    xhs_card=xhs,
-                    douyin_card=douyin,
-                    card_style=card_style,
-                )
-        except Exception:
-            self._status.set("失败")
-            messagebox.showerror("处理失败", traceback.format_exc())
-            return
-
-        if total == 1:
-            self._status.set(f"完成 → {jobs[0][1]}")
-            messagebox.showinfo("完成", f"已保存：\n{jobs[0][1]}")
-        else:
-            roots = {str(d.parent) for _, d in jobs}
-            where = "\n".join(sorted(roots))
-            self._status.set(f"完成 {total} 张")
-            messagebox.showinfo("完成", f"已处理 {total} 张图片。\n输出目录：\n{where}")
+        self._worker = threading.Thread(target=task, daemon=True)
+        self._worker.start()
 
 
 def main() -> None:

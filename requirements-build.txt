@@ -1,0 +1,3 @@
+# Runtime deps + PyInstaller (UTF-8: avoid non-ASCII in this file for Windows pip GBK)
+-r requirements-image.txt
+pyinstaller>=6.0.0
